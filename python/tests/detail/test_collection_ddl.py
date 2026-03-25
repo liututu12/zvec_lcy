@@ -448,9 +448,17 @@ class TestIndexDDL:
                 "Error message is unreasonable: e=" + str(exc_info.value)
             )
         else:
-            assert INCOMPATIBLE_FUNCTION_ERROR_MSG in str(exc_info.value), (
-                "Error message is unreasonable: e=" + str(exc_info.value)
-            )
+            # For non-string values like None, int, float, etc., we may get either
+            # INCOMPATIBLE_FUNCTION_ERROR_MSG, SCHEMA_VALIDATE_ERROR_MSG, INCOMPATIBLE_CONSTRUCTOR_ERROR_MSG
+            error_str = str(exc_info.value)
+            # Check if the error contains expected patterns
+            expected_patterns = [
+                INCOMPATIBLE_FUNCTION_ERROR_MSG,
+                SCHEMA_VALIDATE_ERROR_MSG,
+                INCOMPATIBLE_CONSTRUCTOR_ERROR_MSG,
+            ]
+            if not any(pattern in error_str for pattern in expected_patterns):
+                assert False, "Error message is unreasonable: e=" + error_str
 
     @pytest.mark.parametrize(
         "invalid_field_name,invalid_vector_name",
@@ -781,7 +789,7 @@ class TestIndexDDL:
     @pytest.mark.parametrize(
         "data_type, index_param", VALID_VECTOR_DATA_TYPE_INDEX_PARAM_MAP_PARAMS
     )
-    def test_vector_index_params(
+    def test_valid_vector_index_params(
         self,
         collection_temp_dir,
         collection_option: CollectionOption,
@@ -910,6 +918,39 @@ class TestIndexDDL:
             "post_create_index2", index_param.metric_type, index_param.quantize_type
         )
         coll.destroy()
+
+    @pytest.mark.parametrize(
+        "data_type, index_param", INVALID_VECTOR_DATA_TYPE_INDEX_PARAM_MAP_PARAMS
+    )
+    def test_invalid_vector_index_params(
+        self,
+        collection_temp_dir,
+        collection_option: CollectionOption,
+        data_type: DataType,
+        index_param,
+        single_vector_schema,
+    ):
+        vector_name = DEFAULT_VECTOR_FIELD_NAME[data_type]
+        dimension = DEFAULT_VECTOR_DIMENSION
+
+        coll = zvec.create_and_open(
+            path=collection_temp_dir,
+            schema=single_vector_schema,
+            option=collection_option,
+        )
+
+        assert coll is not None, (
+            f"Failed to create and open collection, {data_type}, {index_param}"
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            # create index
+            coll.create_index(
+                field_name=vector_name,
+                index_param=index_param,
+                option=IndexOption(),
+            )
+        self.check_error_message(exc_info, index_param)
 
 
 class TestColumnDDL:
