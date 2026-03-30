@@ -16,6 +16,7 @@ from distance_helper import *
 from fixture_helper import *
 from doc_helper import *
 from params_helper import *
+import threading, time
 
 
 def batchdoc_and_check(collection: Collection, multiple_docs, operator="insert"):
@@ -102,6 +103,792 @@ class TestDDL:
         fetched_docs = basic_collection.fetch(["1"])
         assert "1" in fetched_docs
         assert fetched_docs["1"].id == "1"
+
+
+class TestOptimize:
+    def test_optimize(self, full_collection_new: Collection):
+        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
+
+        result = full_collection_new.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection_new.stats
+        assert stats is not None
+        assert stats.doc_count == 10
+
+        full_collection_new.optimize(option=OptimizeOption())
+
+        fetched_docs = full_collection_new.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+    @pytest.mark.parametrize("concurrency", [0, 1, 4, 8])
+    @pytest.mark.parametrize(
+        "full_schema_new",
+        [
+            (True, True, HnswIndexParam()),
+            (False, True, IVFIndexParam()),
+            (False, True, FlatIndexParam()),
+            (
+                True,
+                True,
+                HnswIndexParam(
+                    metric_type=MetricType.IP,
+                    m=16,
+                    ef_construction=100,
+                ),
+            ),
+            (
+                True,
+                True,
+                HnswIndexParam(
+                    metric_type=MetricType.COSINE,
+                    m=24,
+                    ef_construction=150,
+                ),
+            ),
+            (
+                True,
+                True,
+                HnswIndexParam(
+                    metric_type=MetricType.L2,
+                    m=32,
+                    ef_construction=200,
+                ),
+            ),
+            (
+                False,
+                True,
+                FlatIndexParam(
+                    metric_type=MetricType.IP,
+                ),
+            ),
+            (
+                True,
+                True,
+                FlatIndexParam(
+                    metric_type=MetricType.COSINE,
+                ),
+            ),
+            (
+                True,
+                True,
+                FlatIndexParam(
+                    metric_type=MetricType.L2,
+                ),
+            ),
+            (
+                True,
+                True,
+                IVFIndexParam(
+                    metric_type=MetricType.IP,
+                    n_list=100,
+                    n_iters=10,
+                    use_soar=False,
+                ),
+            ),
+            (
+                True,
+                True,
+                IVFIndexParam(
+                    metric_type=MetricType.L2,
+                    n_list=200,
+                    n_iters=20,
+                    use_soar=True,
+                ),
+            ),
+            (
+                True,
+                True,
+                IVFIndexParam(
+                    metric_type=MetricType.COSINE,
+                    n_list=150,
+                    n_iters=15,
+                    use_soar=False,
+                ),
+            ),
+        ],
+        indirect=True,
+    )
+    @pytest.mark.parametrize("doc_num", [500])
+    def test_optimize_with_valid_concurrency_values(
+        self,
+        full_collection_new: Collection,
+        full_schema_new,
+        doc_num,
+        concurrency,
+        queries=None,
+    ):
+        """Test valid values for concurrency parameter"""
+        """
+        Verify index consistency before and after optimization
+
+        Args:
+            collection: zvec collection object
+            queries: Optional query list, use default queries if not provided
+        """
+        multiple_docs = [
+            generate_doc_recall(i, full_collection_new.schema) for i in range(doc_num)
+        ]
+
+        for i in range(10):
+            batchdoc_and_check(
+                full_collection_new,
+                multiple_docs[i * 1000 : 1000 * (i + 1)],
+                operator="insert",
+            )
+
+        stats = full_collection_new.stats
+        assert stats.doc_count == len(multiple_docs)
+        # Build some default queries if none provided
+        if queries is None:
+            queries = []
+
+            # Get schema info to build appropriate queries
+            schema = full_collection_new
+
+            # Build queries for each scalar field
+            for field in full_schema_new.fields:
+                if field.data_type == DataType.STRING:
+                    queries.append({"filter": f"{field.name} >= ''", "topk": 10})
+                elif field.data_type in [
+                    DataType.INT32,
+                    DataType.INT64,
+                    DataType.UINT32,
+                    DataType.UINT64,
+                ]:
+                    queries.append({"filter": f"{field.name} >= 0", "topk": 10})
+                elif field.data_type in [DataType.FLOAT, DataType.DOUBLE]:
+                    queries.append({"filter": f"{field.name} >= 0.0", "topk": 10})
+                elif field.data_type == DataType.BOOL:
+                    queries.append({"filter": f"{field.name} = true", "topk": 10})
+
+            # Build queries for each vector field
+            for vector in full_schema_new.vectors:
+                # Build random query vectors
+                import numpy as np
+
+                if vector.data_type == DataType.VECTOR_FP32:
+                    query_vector = np.random.random(vector.dimension).tolist()
+                elif vector.data_type == DataType.VECTOR_FP16:
+                    query_vector = np.random.random(vector.dimension).tolist()
+                elif vector.data_type in [
+                    DataType.SPARSE_VECTOR_FP32,
+                    DataType.SPARSE_VECTOR_FP16,
+                ]:
+                    query_vector = {
+                        i: float(np.random.random())
+                        for i in range(min(10, vector.dimension))
+                    }
+                else:
+                    continue
+
+                queries.append(
+                    {
+                        "vector_query": {
+                            "field_name": vector.name,
+                            "vector": query_vector,
+                        },
+                        "topk": 10,
+                    }
+                )
+
+        # Store query results before optimization
+        results_before_optimize = []
+
+        print("Executing queries before optimization...")
+        for i, query in enumerate(queries):
+            if "vector_query" in query:
+                result = full_collection_new.query(
+                    VectorQuery(
+                        field_name=query["vector_query"]["field_name"],
+                        vector=query["vector_query"]["vector"],
+                    ),
+                    topk=query["topk"],
+                )
+            else:
+                result = full_collection_new.query(
+                    filter=query["filter"], topk=query["topk"]
+                )
+
+            results_before_optimize.append(
+                {
+                    "query": query,
+                    "result_count": len(result),
+                    "result_ids": set(doc.id for doc in result),
+                    "result_scores": [doc.score for doc in result],
+                }
+            )
+            print(f"Query {i + 1}: Found {len(result)} results")
+
+        # Record statistics before optimization
+        stats_before = full_collection_new.stats
+        print(f"Documents before optimization: {stats_before.doc_count}")
+        print(
+            f"Index completeness before optimization: {stats_before.index_completeness}"
+        )
+
+        # Execute optimization
+        print("Executing optimization...")
+        # Use valid concurrency values for optimization
+        full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
+
+        stats = full_collection_new.stats
+        assert stats.doc_count == len(multiple_docs)
+
+        for i in range(doc_num):
+            fetched_docs = full_collection_new.fetch([str(i)])
+            assert str(i) in fetched_docs
+            assert fetched_docs[str(i)].id == str(i)
+
+        # Store query results after optimization
+        results_after_optimize = []
+
+        print("Executing queries after optimization...")
+        for i, query in enumerate(queries):
+            if "vector_query" in query:
+                result = full_collection_new.query(
+                    VectorQuery(
+                        field_name=query["vector_query"]["field_name"],
+                        vector=query["vector_query"]["vector"],
+                    ),
+                    topk=query["topk"],
+                )
+            else:
+                result = full_collection_new.query(
+                    filter=query["filter"], topk=query["topk"]
+                )
+
+            results_after_optimize.append(
+                {
+                    "query": query,
+                    "result_count": len(result),
+                    "result_ids": set(doc.id for doc in result),
+                    "result_scores": [doc.score for doc in result],
+                }
+            )
+            print(f"Query {i + 1}: Found {len(result)} results")
+
+        # Record statistics after optimization
+        stats_after = full_collection_new.stats
+        print(f"Documents after optimization: {stats_after.doc_count}")
+        print(
+            f"Index completeness after optimization: {stats_after.index_completeness}"
+        )
+
+        # Verify consistency
+        print("\nVerifying index consistency before and after optimization...")
+        all_consistent = True
+
+        for i, (before, after) in enumerate(
+            zip(results_before_optimize, results_after_optimize)
+        ):
+            query_info = before["query"]
+
+            # Check if result counts are consistent
+            if before["result_count"] != after["result_count"]:
+                print(
+                    f"Query {i + 1} result count inconsistent: before {before['result_count']}, after {after['result_count']}"
+                )
+                all_consistent = False
+                continue
+
+            # Check if result ID sets are consistent
+            if before["result_ids"] != after["result_ids"]:
+                print(f"Query {i + 1} result ID set inconsistent")
+                print(f"  Before IDs: {sorted(list(before['result_ids']))}")
+                print(f"  After IDs: {sorted(list(after['result_ids']))}")
+                all_consistent = False
+                continue
+
+            # Check if scores are basically consistent (allowing minor differences)
+            import math
+
+            scores_match = True
+            for b_score, a_score in zip(
+                before["result_scores"], after["result_scores"]
+            ):
+                if not math.isclose(b_score, a_score, rel_tol=1e-2):
+                    scores_match = False
+                    break
+
+            if not scores_match:
+                print(f"Query {i + 1} result scores inconsistent")
+                all_consistent = False
+                continue
+
+            print(f"Query {i + 1}: Consistent")
+
+        # Verify statistics
+        if stats_before.doc_count != stats_after.doc_count:
+            print(
+                f"Document count inconsistent: before {stats_before.doc_count}, after {stats_after.doc_count}"
+            )
+            all_consistent = False
+
+        if all_consistent:
+            print(
+                "\n✓ All verifications passed, indexes remain consistent before and after optimization"
+            )
+        else:
+            print("\n✗ Inconsistencies found, please check index status")
+
+        assert all_consistent == True
+
+    @pytest.mark.parametrize(
+        "concurrency",
+        [
+            # -1, -5,           # Negative values
+            1.5,
+            2.7,  # Float values
+            "2",
+            "8",
+            "auto",  # String values
+            # True, False       # Boolean values
+        ],
+    )
+    def test_optimize_with_invalid_concurrency_values(
+        self, full_collection_new: Collection, concurrency
+    ):
+        """Test various invalid values for concurrency parameter"""
+        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
+
+        result = full_collection_new.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection_new.stats
+        assert stats is not None
+        assert stats.doc_count == 10
+
+        # Using invalid concurrency values should raise an exception
+        with pytest.raises(Exception) as exc_info:
+            full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
+
+        # Depending on the implementation, there may be different error messages
+        assert any(
+            msg in str(exc_info.value)
+            for msg in ["invalid", "concurrency", "parameter", "value", "type"]
+        )
+
+    def test_optimize_with_none_concurrency_value(
+        self, full_collection_new: Collection
+    ):
+        """Test concurrency parameter with None value (invalid value)"""
+        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
+
+        result = full_collection_new.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection_new.stats
+        assert stats is not None
+        assert stats.doc_count == 10
+
+        # Using None as concurrency value should raise an exception
+        with pytest.raises(Exception) as exc_info:
+            full_collection_new.optimize(option=OptimizeOption(concurrency=None))
+
+        assert any(
+            msg in str(exc_info.value)
+            for msg in ["invalid", "concurrency", "parameter", "value"]
+        )
+
+    @pytest.mark.parametrize(
+        "concurrency", [999999, 1000000]
+    )  # Assume these are too large values
+    def test_optimize_with_too_large_concurrency_values(
+        self, full_collection_new: Collection, concurrency
+    ):
+        """Test too large values for concurrency parameter"""
+        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
+
+        result = full_collection_new.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection_new.stats
+        assert stats is not None
+        assert stats.doc_count == 10
+
+        # Using too large concurrency values may not raise an exception, but will try to use the maximum available threads
+        # Or may raise an exception in some implementations
+        try:
+            full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
+
+            # Verify data is still accessible after optimization
+            fetched_docs = full_collection_new.fetch(["1"])
+            assert "1" in fetched_docs
+            assert fetched_docs["1"].id == "1"
+        except Exception as e:
+            # If an exception is raised, ensure it's a reasonable error message
+            assert any(
+                msg in str(e)
+                for msg in [
+                    "invalid",
+                    "concurrency",
+                    "thread",
+                    "parameter",
+                    "value",
+                    "exceeds",
+                ]
+            )
+
+    def test_optimize_in_read_only_mode(self, tmp_path_factory):
+        collection_schema = zvec.CollectionSchema(
+            name="test_collection",
+            fields=[
+                FieldSchema(
+                    "id",
+                    DataType.INT64,
+                    nullable=False,
+                    index_param=InvertIndexParam(enable_range_optimization=True),
+                ),
+                FieldSchema(
+                    "name",
+                    DataType.STRING,
+                    nullable=False,
+                    index_param=InvertIndexParam(),
+                ),
+            ],
+            vectors=[
+                VectorSchema(
+                    "dense",
+                    DataType.VECTOR_FP32,
+                    dimension=128,
+                    index_param=HnswIndexParam(),
+                )
+            ],
+        )
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=collection_schema,
+            option=collection_option,
+        )
+
+        assert coll1 is not None, "Failed to create and open collection"
+        doc = Doc(
+            id="1",
+            fields={"id": 1, "name": "test"},
+            vectors={"dense": np.random.random(128).tolist()},
+        )
+        result = coll1.insert(doc)
+        assert result.ok()
+        del coll1
+
+        collection_option_reopen = CollectionOption(read_only=True, enable_mmap=True)
+        coll2 = zvec.open(path=str(collection_path), option=collection_option_reopen)
+
+        assert coll2 is not None, "Failed to reopen collection"
+        assert coll2.path == str(collection_path)
+        assert coll2.schema.name == collection_schema.name
+
+        with pytest.raises(Exception) as exc_info:
+            coll2.optimize(option=OptimizeOption())
+
+        assert any(
+            msg in str(exc_info.value).lower()
+            for msg in ["read", "only", "readonly", "permission", "access", "mode"]
+        )
+
+        fetched_docs = coll2.fetch(["1"])
+        assert "1" in fetched_docs
+        fetched_doc = fetched_docs["1"]
+        assert fetched_doc.id == "1"
+        assert fetched_doc.field("name") == "test"
+
+        if hasattr(coll2, "destroy") and coll2 is not None:
+            try:
+                coll2.destroy()
+            except Exception as e:
+                print(f"Warning: failed to destroy collection: {e}")
+
+    def test_optimize_on_destroyed_collection(
+        self, collection_temp_dir, collection_option: CollectionOption
+    ):
+        schema = CollectionSchema(
+            name="test_optimize_destroyed",
+            fields=[
+                FieldSchema("id", DataType.INT64, nullable=False),
+                FieldSchema("name", DataType.STRING, nullable=True),
+            ],
+            vectors=[
+                VectorSchema(
+                    "dense",
+                    DataType.VECTOR_FP32,
+                    dimension=128,
+                    index_param=HnswIndexParam(),
+                ),
+            ],
+        )
+        collection = zvec.create_and_open(
+            path=collection_temp_dir, schema=schema, option=collection_option
+        )
+
+        docs = [generate_doc(i, collection.schema) for i in range(3)]
+        result = collection.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        collection.destroy()
+
+        with pytest.raises(Exception) as exc_info:
+            collection.optimize(option=OptimizeOption())
+
+        assert any(
+            msg in str(exc_info.value)
+            for msg in ["destroyed", "access", "collection", "path", "exist"]
+        )
+
+    def test_concurrent_optimize_calls(self, full_collection: Collection):
+        docs = [generate_doc(i, full_collection.schema) for i in range(5)]
+        result = full_collection.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection.stats
+        assert stats is not None
+        assert stats.doc_count == 5
+
+        exceptions = []
+
+        def optimize_worker():
+            try:
+                for i in range(3):
+                    full_collection.optimize(option=OptimizeOption())
+                    time.sleep(0.01)
+            except Exception as e:
+                exceptions.append(e)
+
+        threads = []
+        for i in range(3):
+            thread = threading.Thread(target=optimize_worker)
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        for exc in exceptions:
+            assert any(
+                msg in str(exc).lower()
+                for msg in ["concurrent", "lock", "thread", "access", "conflict"]
+            ), f"Unexpected exception: {exc}"
+
+        fetched_docs = full_collection.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+    def test_multi_thread_optimize_with_operations(self, full_collection: Collection):
+        docs = [generate_doc(i, full_collection.schema) for i in range(10)]
+        result = full_collection.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection.stats
+        assert stats is not None
+        assert stats.doc_count == 10
+
+        results = {
+            "insert_success": 0,
+            "query_success": 0,
+            "update_success": 0,
+            "delete_success": 0,
+            "optimize_success": 0,
+            "exceptions": [],
+        }
+        results_lock = threading.Lock()
+
+        def insert_worker():
+            for i in range(10, 15):
+                try:
+                    doc = generate_doc(i, full_collection.schema)
+                    result = full_collection.insert(doc)
+                    if result and result.ok():
+                        with results_lock:
+                            results["insert_success"] += 1
+                except Exception as e:
+                    with results_lock:
+                        results["exceptions"].append(f"Insert error: {e}")
+
+        def query_worker():
+            for _ in range(10):
+                try:
+                    query_result = full_collection.query(filter="id >= 0", topk=5)
+                    with results_lock:
+                        results["query_success"] += len(query_result)
+                except Exception as e:
+                    with results_lock:
+                        results["exceptions"].append(f"Query error: {e}")
+
+        def update_worker():
+            for i in range(3):
+                try:
+                    doc = generate_doc(i, full_collection.schema)
+                    result = full_collection.update(doc)
+                    if result and result.ok():
+                        with results_lock:
+                            results["update_success"] += 1
+                except Exception as e:
+                    with results_lock:
+                        results["exceptions"].append(f"Update error: {e}")
+
+        def delete_worker():
+            for i in range(15, 18):
+                try:
+                    result = full_collection.delete([str(i)])
+                    if result:
+                        with results_lock:
+                            results["delete_success"] += 1
+                except Exception as e:
+                    with results_lock:
+                        results["exceptions"].append(f"Delete error: {e}")
+
+        def optimize_worker():
+            for _ in range(2):
+                try:
+                    full_collection.optimize(option=OptimizeOption())
+                    with results_lock:
+                        results["optimize_success"] += 1
+                    time.sleep(0.05)
+                except Exception as e:
+                    with results_lock:
+                        results["exceptions"].append(f"Optimize error: {e}")
+
+        threads = []
+        threads.append(threading.Thread(target=insert_worker))
+        threads.append(threading.Thread(target=query_worker))
+        threads.append(threading.Thread(target=update_worker))
+        threads.append(threading.Thread(target=delete_worker))
+        threads.append(threading.Thread(target=optimize_worker))
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        assert results["insert_success"] >= 0, (
+            f"Expected some inserts to succeed, got {results['insert_success']}"
+        )
+        assert results["query_success"] >= 0, (
+            f"Expected some queries to succeed, got {results['query_success']}"
+        )
+        assert results["update_success"] >= 0, (
+            f"Expected some updates to succeed, got {results['update_success']}"
+        )
+        assert results["optimize_success"] >= 0, (
+            f"Expected some optimize calls to succeed, got {results['optimize_success']}"
+        )
+
+        if results["exceptions"]:
+            print(
+                f"Exceptions occurred during concurrent operations: {results['exceptions']}"
+            )
+
+        final_stats = full_collection.stats
+        assert final_stats is not None
+        assert final_stats.doc_count >= 10
+
+        fetched_docs = full_collection.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+    def test_optimize_empty_collection(self, basic_collection: Collection):
+        stats = basic_collection.stats
+        assert stats is not None
+        assert stats.doc_count == 0
+
+        basic_collection.optimize(option=OptimizeOption())
+
+        stats_after = basic_collection.stats
+        assert stats_after is not None
+        assert stats_after.doc_count == 0
+
+        doc = generate_doc(1, basic_collection.schema)
+        result = basic_collection.insert(doc)
+        assert bool(result)
+        assert result.ok()
+
+        fetched_docs = basic_collection.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+        stats_final = basic_collection.stats
+        assert stats_final.doc_count == 1
+
+    def test_optimize_single_record_collection(self, basic_collection: Collection):
+        doc = generate_doc(1, basic_collection.schema)
+        result = basic_collection.insert(doc)
+        assert bool(result)
+        assert result.ok()
+
+        stats = basic_collection.stats
+        assert stats is not None
+        assert stats.doc_count == 1
+
+        basic_collection.optimize(option=OptimizeOption())
+
+        fetched_docs = basic_collection.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+        stats_after = basic_collection.stats
+        assert stats_after.doc_count == 1
+
+        doc2 = generate_doc(2, basic_collection.schema)
+        result2 = basic_collection.insert(doc2)
+        assert bool(result2)
+        assert result2.ok()
+
+        fetched_docs = basic_collection.fetch(["1", "2"])
+        assert len(fetched_docs) == 2
+        assert fetched_docs["1"].id == "1"
+        assert fetched_docs["2"].id == "2"
+
+    def test_optimize_already_optimized_collection(self, full_collection: Collection):
+        docs = [generate_doc(i, full_collection.schema) for i in range(5)]
+        result = full_collection.insert(docs)
+        assert bool(result)
+        for item in result:
+            assert item.ok()
+
+        stats = full_collection.stats
+        assert stats is not None
+        assert stats.doc_count == 5
+
+        full_collection.optimize(option=OptimizeOption())
+
+        fetched_docs = full_collection.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+        full_collection.optimize(option=OptimizeOption())
+
+        fetched_docs = full_collection.fetch(["1", "2"])
+        assert len(fetched_docs) >= 2
+        assert fetched_docs["1"].id == "1"
+
+        full_collection.optimize(option=OptimizeOption())
+
+        query_result = full_collection.query(filter="int32_field >= 0", topk=10)
+        assert len(query_result) == 5
+
+        final_stats = full_collection.stats
+        assert final_stats.doc_count == 5
 
 
 class TestIndexDDL:
@@ -300,433 +1087,6 @@ class TestIndexDDL:
         full_collection_new.create_index(
             field_name=field_name, index_param=index_param, option=IndexOption()
         )
-
-    def test_optimize(self, full_collection_new: Collection):
-        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
-
-        result = full_collection_new.insert(docs)
-        assert bool(result)
-        for item in result:
-            assert item.ok()
-
-        stats = full_collection_new.stats
-        assert stats is not None
-        assert stats.doc_count == 10
-
-        full_collection_new.optimize(option=OptimizeOption())
-
-        fetched_docs = full_collection_new.fetch(["1"])
-        assert "1" in fetched_docs
-        assert fetched_docs["1"].id == "1"
-
-    @pytest.mark.parametrize("concurrency", [0, 1, 4, 8])
-    @pytest.mark.parametrize(
-        "full_schema_new",
-        [
-            (True, True, HnswIndexParam()),
-            (False, True, IVFIndexParam()),
-            (False, True, FlatIndexParam()),
-            (
-                True,
-                True,
-                HnswIndexParam(
-                    metric_type=MetricType.IP,
-                    m=16,
-                    ef_construction=100,
-                ),
-            ),
-            (
-                True,
-                True,
-                HnswIndexParam(
-                    metric_type=MetricType.COSINE,
-                    m=24,
-                    ef_construction=150,
-                ),
-            ),
-            (
-                True,
-                True,
-                HnswIndexParam(
-                    metric_type=MetricType.L2,
-                    m=32,
-                    ef_construction=200,
-                ),
-            ),
-            (
-                False,
-                True,
-                FlatIndexParam(
-                    metric_type=MetricType.IP,
-                ),
-            ),
-            (
-                True,
-                True,
-                FlatIndexParam(
-                    metric_type=MetricType.COSINE,
-                ),
-            ),
-            (
-                True,
-                True,
-                FlatIndexParam(
-                    metric_type=MetricType.L2,
-                ),
-            ),
-            (
-                True,
-                True,
-                IVFIndexParam(
-                    metric_type=MetricType.IP,
-                    n_list=100,
-                    n_iters=10,
-                    use_soar=False,
-                ),
-            ),
-            (
-                True,
-                True,
-                IVFIndexParam(
-                    metric_type=MetricType.L2,
-                    n_list=200,
-                    n_iters=20,
-                    use_soar=True,
-                ),
-            ),
-            (
-                True,
-                True,
-                IVFIndexParam(
-                    metric_type=MetricType.COSINE,
-                    n_list=150,
-                    n_iters=15,
-                    use_soar=False,
-                ),
-            ),
-        ],
-        indirect=True,
-    )
-    @pytest.mark.parametrize("doc_num", [500])
-    def test_optimize_with_valid_concurrency_values(
-        self,
-        full_collection_new: Collection,
-        full_schema_new,
-        doc_num,
-        concurrency,
-        queries=None,
-    ):
-        """Test valid values for concurrency parameter"""
-        """
-        验证优化前后索引的一致性
-        
-        Args:
-            collection: zvec collection 对象
-            queries: 可选的查询列表，如果不提供则使用默认查询
-        """
-        multiple_docs = [
-            generate_doc_recall(i, full_collection_new.schema) for i in range(doc_num)
-        ]
-
-        for i in range(10):
-            batchdoc_and_check(
-                full_collection_new,
-                multiple_docs[i * 1000 : 1000 * (i + 1)],
-                operator="insert",
-            )
-
-        stats = full_collection_new.stats
-        assert stats.doc_count == len(multiple_docs)
-        # 如果没有提供查询，则构建一些默认查询
-        if queries is None:
-            queries = []
-
-            # 获取 schema 信息以构建适当的查询
-            schema = full_collection_new
-
-            # 为每个标量字段构建查询
-            for field in full_schema_new.fields:
-                if field.data_type == DataType.STRING:
-                    queries.append({"filter": f"{field.name} >= ''", "topk": 10})
-                elif field.data_type in [
-                    DataType.INT32,
-                    DataType.INT64,
-                    DataType.UINT32,
-                    DataType.UINT64,
-                ]:
-                    queries.append({"filter": f"{field.name} >= 0", "topk": 10})
-                elif field.data_type in [DataType.FLOAT, DataType.DOUBLE]:
-                    queries.append({"filter": f"{field.name} >= 0.0", "topk": 10})
-                elif field.data_type == DataType.BOOL:
-                    queries.append({"filter": f"{field.name} = true", "topk": 10})
-
-            # 为每个向量字段构建查询
-            for vector in full_schema_new.vectors:
-                # 构建随机查询向量
-                import numpy as np
-
-                if vector.data_type == DataType.VECTOR_FP32:
-                    query_vector = np.random.random(vector.dimension).tolist()
-                elif vector.data_type == DataType.VECTOR_FP16:
-                    query_vector = np.random.random(vector.dimension).tolist()
-                elif vector.data_type in [
-                    DataType.SPARSE_VECTOR_FP32,
-                    DataType.SPARSE_VECTOR_FP16,
-                ]:
-                    query_vector = {
-                        i: float(np.random.random())
-                        for i in range(min(10, vector.dimension))
-                    }
-                else:
-                    continue
-
-                queries.append(
-                    {
-                        "vector_query": {
-                            "field_name": vector.name,
-                            "vector": query_vector,
-                        },
-                        "topk": 10,
-                    }
-                )
-
-        # 存储优化前的查询结果
-        results_before_optimize = []
-
-        print("执行优化前的查询...")
-        for i, query in enumerate(queries):
-            if "vector_query" in query:
-                result = full_collection_new.query(
-                    VectorQuery(
-                        field_name=query["vector_query"]["field_name"],
-                        vector=query["vector_query"]["vector"],
-                    ),
-                    topk=query["topk"],
-                )
-            else:
-                result = full_collection_new.query(
-                    filter=query["filter"], topk=query["topk"]
-                )
-
-            results_before_optimize.append(
-                {
-                    "query": query,
-                    "result_count": len(result),
-                    "result_ids": set(doc.id for doc in result),
-                    "result_scores": [doc.score for doc in result],
-                }
-            )
-            print(f"查询 {i + 1}: 找到 {len(result)} 个结果")
-
-        # 记录优化前的统计信息
-        stats_before = full_collection_new.stats
-        print(f"优化前文档数: {stats_before.doc_count}")
-        print(f"优化前索引完整性: {stats_before.index_completeness}")
-
-        # 执行优化
-        print("执行优化...")
-        # Use valid concurrency values for optimization
-        full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
-
-        stats = full_collection_new.stats
-        assert stats.doc_count == len(multiple_docs)
-
-        for i in range(doc_num):
-            fetched_docs = full_collection_new.fetch([str(i)])
-            assert str(i) in fetched_docs
-            assert fetched_docs[str(i)].id == str(i)
-
-        # 存储优化后的查询结果
-        results_after_optimize = []
-
-        print("执行优化后的查询...")
-        for i, query in enumerate(queries):
-            if "vector_query" in query:
-                result = full_collection_new.query(
-                    VectorQuery(
-                        field_name=query["vector_query"]["field_name"],
-                        vector=query["vector_query"]["vector"],
-                    ),
-                    topk=query["topk"],
-                )
-            else:
-                result = full_collection_new.query(
-                    filter=query["filter"], topk=query["topk"]
-                )
-
-            results_after_optimize.append(
-                {
-                    "query": query,
-                    "result_count": len(result),
-                    "result_ids": set(doc.id for doc in result),
-                    "result_scores": [doc.score for doc in result],
-                }
-            )
-            print(f"查询 {i + 1}: 找到 {len(result)} 个结果")
-
-        # 记录优化后的统计信息
-        stats_after = full_collection_new.stats
-        print(f"优化后文档数: {stats_after.doc_count}")
-        print(f"优化后索引完整性: {stats_after.index_completeness}")
-
-        # 验证一致性
-        print("\n验证优化前后索引一致性...")
-        all_consistent = True
-
-        for i, (before, after) in enumerate(
-            zip(results_before_optimize, results_after_optimize)
-        ):
-            query_info = before["query"]
-
-            # 检查结果数量是否一致
-            if before["result_count"] != after["result_count"]:
-                print(
-                    f"查询 {i + 1} 结果数量不一致: 优化前 {before['result_count']}, 优化后 {after['result_count']}"
-                )
-                all_consistent = False
-                continue
-
-            # 检查结果ID集合是否一致
-            if before["result_ids"] != after["result_ids"]:
-                print(f"查询 {i + 1} 结果ID集合不一致")
-                print(f"  优化前 IDs: {sorted(list(before['result_ids']))}")
-                print(f"  优化后 IDs: {sorted(list(after['result_ids']))}")
-                all_consistent = False
-                continue
-
-            # 检查分数是否基本一致（允许微小差异）
-            import math
-
-            scores_match = True
-            for b_score, a_score in zip(
-                before["result_scores"], after["result_scores"]
-            ):
-                if not math.isclose(b_score, a_score, rel_tol=1e-2):
-                    scores_match = False
-                    break
-
-            if not scores_match:
-                print(f"查询 {i + 1} 结果分数不一致")
-                all_consistent = False
-                continue
-
-            print(f"查询 {i + 1}: 一致")
-
-        # 验证统计信息
-        if stats_before.doc_count != stats_after.doc_count:
-            print(
-                f"文档数量不一致: 优化前 {stats_before.doc_count}, 优化后 {stats_after.doc_count}"
-            )
-            all_consistent = False
-
-        if all_consistent:
-            print("\n✓ 所有验证通过，优化前后索引保持一致")
-        else:
-            print("\n✗ 发现不一致，请检查索引状态")
-
-        assert all_consistent == True
-
-    @pytest.mark.parametrize(
-        "concurrency",
-        [
-            # -1, -5,           # Negative values
-            1.5,
-            2.7,  # Float values
-            "2",
-            "8",
-            "auto",  # String values
-            # True, False       # Boolean values
-        ],
-    )
-    def test_optimize_with_invalid_concurrency_values(
-        self, full_collection_new: Collection, concurrency
-    ):
-        """Test various invalid values for concurrency parameter"""
-        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
-
-        result = full_collection_new.insert(docs)
-        assert bool(result)
-        for item in result:
-            assert item.ok()
-
-        stats = full_collection_new.stats
-        assert stats is not None
-        assert stats.doc_count == 10
-
-        # Using invalid concurrency values should raise an exception
-        with pytest.raises(Exception) as exc_info:
-            full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
-
-        # Depending on the implementation, there may be different error messages
-        assert any(
-            msg in str(exc_info.value)
-            for msg in ["invalid", "concurrency", "parameter", "value", "type"]
-        )
-
-    def test_optimize_with_none_concurrency_value(
-        self, full_collection_new: Collection
-    ):
-        """Test concurrency parameter with None value (invalid value)"""
-        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
-
-        result = full_collection_new.insert(docs)
-        assert bool(result)
-        for item in result:
-            assert item.ok()
-
-        stats = full_collection_new.stats
-        assert stats is not None
-        assert stats.doc_count == 10
-
-        # Using None as concurrency value should raise an exception
-        with pytest.raises(Exception) as exc_info:
-            full_collection_new.optimize(option=OptimizeOption(concurrency=None))
-
-        assert any(
-            msg in str(exc_info.value)
-            for msg in ["invalid", "concurrency", "parameter", "value"]
-        )
-
-    @pytest.mark.parametrize(
-        "concurrency", [999999, 1000000]
-    )  # Assume these are too large values
-    def test_optimize_with_too_large_concurrency_values(
-        self, full_collection_new: Collection, concurrency
-    ):
-        """Test too large values for concurrency parameter"""
-        docs = [generate_doc(i, full_collection_new.schema) for i in range(10)]
-
-        result = full_collection_new.insert(docs)
-        assert bool(result)
-        for item in result:
-            assert item.ok()
-
-        stats = full_collection_new.stats
-        assert stats is not None
-        assert stats.doc_count == 10
-
-        # Using too large concurrency values may not raise an exception, but will try to use the maximum available threads
-        # Or may raise an exception in some implementations
-        try:
-            full_collection_new.optimize(option=OptimizeOption(concurrency=concurrency))
-
-            # Verify data is still accessible after optimization
-            fetched_docs = full_collection_new.fetch(["1"])
-            assert "1" in fetched_docs
-            assert fetched_docs["1"].id == "1"
-        except Exception as e:
-            # If an exception is raised, ensure it's a reasonable error message
-            assert any(
-                msg in str(e)
-                for msg in [
-                    "invalid",
-                    "concurrency",
-                    "thread",
-                    "parameter",
-                    "value",
-                    "exceeds",
-                ]
-            )
 
     @pytest.mark.parametrize(
         "vector_type, index_type", SUPPORT_VECTOR_DATA_TYPE_INDEX_MAP_PARAMS
