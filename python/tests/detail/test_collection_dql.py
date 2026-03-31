@@ -24,8 +24,6 @@ from zvec.model.param import (
     HnswQueryParam,
     IVFQueryParam,
 )
-
-
 from zvec.model.schema import FieldSchema, VectorSchema
 from zvec.extension import RrfReRanker, WeightedReRanker, QwenReRanker
 from distance_helper import *
@@ -545,19 +543,12 @@ class TestCollectionQuery:
             generate_doc(i, full_collection.schema) for i in range(doc_num)
         ]
         batchdoc_and_check(full_collection, multiple_docs, doc_num, operator="insert")
-
-        # Execute the query with the complex filter
         query_result = full_collection.query(filter=filter)
-
-        # Basic validation that query executes without error and returns results
         assert query_result is not None
 
-        # Validate that all returned documents exist in the collection
         for doc in query_result:
             assert hasattr(doc, "id")
             assert doc.id in [d.id for d in multiple_docs]
-
-        # Perform basic check on the query results
         single_querydoc_check(multiple_docs, query_result, full_collection)
 
     @pytest.mark.parametrize(
