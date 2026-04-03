@@ -18,6 +18,87 @@ from doc_helper import *
 from params_helper import *
 import threading, time
 
+indextest_collection_schema = zvec.CollectionSchema(
+    name="test_collection",
+    fields=[
+        FieldSchema(
+            "id",
+            DataType.INT64,
+            nullable=False,
+            index_param=InvertIndexParam(enable_range_optimization=True),
+        ),
+        FieldSchema(
+            "name",
+            DataType.STRING,
+            nullable=False,
+            index_param=InvertIndexParam(),
+        ),
+    ],
+    vectors=[
+        VectorSchema(
+            "vector_fp32_field",
+            DataType.VECTOR_FP32,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+        VectorSchema(
+            "vector_fp16_field",
+            DataType.VECTOR_FP16,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+        VectorSchema(
+            "vector_int8_field",
+            DataType.VECTOR_INT8,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+        VectorSchema(
+            "sparse_vector_fp32_field",
+            DataType.SPARSE_VECTOR_FP32,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+        VectorSchema(
+            "sparse_vector_fp16_field",
+            DataType.SPARSE_VECTOR_FP16,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+    ],
+)
+columntest_collection_schema = zvec.CollectionSchema(
+    name="test_collection",
+    fields=[
+        FieldSchema(
+            "id",
+            DataType.INT64,
+            nullable=False,
+            index_param=InvertIndexParam(enable_range_optimization=True),
+        ),
+        FieldSchema(
+            "name",
+            DataType.STRING,
+            nullable=False,
+            index_param=InvertIndexParam(),
+        ),
+    ],
+    vectors=[
+        VectorSchema(
+            "dense_fp32_field",
+            DataType.VECTOR_FP32,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+        VectorSchema(
+            "sparse_fp32_field",
+            DataType.SPARSE_VECTOR_FP32,
+            dimension=128,
+            index_param=HnswIndexParam(),
+        ),
+    ],
+)
+
 
 def batchdoc_and_check(collection: Collection, multiple_docs, operator="insert"):
     if operator == "insert":
@@ -104,6 +185,39 @@ class TestDDL:
         assert "1" in fetched_docs
         assert fetched_docs["1"].id == "1"
 
+    def test_collection_flush_with_reopen(self, tmp_path_factory):
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=columntest_collection_schema,
+            option=collection_option,
+        )
+        assert coll1 is not None, "Failed to create and open collection"
+
+        # Insert some data
+        doc1 = Doc(
+            id="1",
+            fields={"id": 1, "name": "test1"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {1: 1.0, 2: 2.0},
+            },
+        )
+
+        result = coll1.insert(doc1)
+        assert result.ok()
+
+        coll1.flush()
+
+        fetched_docs = coll1.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
 
 class TestOptimize:
     def test_optimize(self, full_collection_new: Collection):
@@ -121,6 +235,39 @@ class TestOptimize:
         full_collection_new.optimize(option=OptimizeOption())
 
         fetched_docs = full_collection_new.fetch(["1"])
+        assert "1" in fetched_docs
+        assert fetched_docs["1"].id == "1"
+
+    def test_optimize_with_reopen(self, tmp_path_factory):
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=columntest_collection_schema,
+            option=collection_option,
+        )
+        assert coll1 is not None, "Failed to create and open collection"
+
+        # Insert some data
+        doc1 = Doc(
+            id="1",
+            fields={"id": 1, "name": "test1"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {1: 1.0, 2: 2.0},
+            },
+        )
+
+        result = coll1.insert(doc1)
+        assert result.ok()
+
+        coll1.optimize(option=OptimizeOption())
+
+        fetched_docs = coll1.fetch(["1"])
         assert "1" in fetched_docs
         assert fetched_docs["1"].id == "1"
 
@@ -1215,6 +1362,154 @@ class TestIndexDDL:
         )
         full_collection_new.destroy()
 
+    @pytest.mark.parametrize(
+        "vector_type, index_type", SUPPORT_VECTOR_DATA_TYPE_INDEX_MAP_PARAMS
+    )
+    def test_vector_index_operation_with_reopen(
+        self, tmp_path_factory, vector_type, index_type
+    ):
+        vector_field_name = DEFAULT_VECTOR_FIELD_NAME[vector_type]
+
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=indextest_collection_schema,
+            option=collection_option,
+        )
+
+        assert coll1 is not None, "Failed to create and open collection"
+
+        docs = [generate_doc(i, coll1.schema) for i in range(5)]
+
+        result = coll1.insert(docs)
+        assert len(result) == 5, (
+            f"Expected 5 insertion results, got {len(result)} for vector type {vector_type} and index type {index_type}"
+        )
+        for i, item in enumerate(result):
+            assert item.ok(), (
+                f"Before create_index,result={result},Insertion result {i} is not OK for vector type {vector_type} and index type {index_type} and result={result}"
+            )
+
+        stats = coll1.stats
+        assert stats is not None, (
+            f"stats is None for vector type {vector_type} and index type {index_type}"
+        )
+        assert stats.doc_count == 5, (
+            f"doc_count!=5 for vector type {vector_type} and index type {index_type}"
+        )
+
+        if index_type not in DEFAULT_INDEX_PARAMS:
+            pytest.fail(
+                f"Unsupported index type {index_type} for vector type {vector_type} in test_vector_all_data_types_index_create_drop_validation"
+            )
+        index_param = DEFAULT_INDEX_PARAMS[index_type]
+
+        coll1.create_index(
+            field_name=vector_field_name,
+            index_param=index_param,
+            option=IndexOption(),
+        )
+
+        # Close the first collection (delete reference)
+        del coll1
+        # Reopen the collection
+        coll2 = zvec.open(path=str(collection_path), option=collection_option)
+
+        stats_after_create = coll2.stats
+        assert stats_after_create is not None, (
+            f"stats_after_create_index is None for vector type {vector_type} and index type {index_type}"
+        )
+
+        new_docs = [generate_doc(i, coll2.schema) for i in range(5, 8)]
+
+        result = coll2.insert(new_docs)
+        assert len(result) == 3, (
+            f"Expected 3 insertion results, got {len(result)} for vector type {vector_type} and index type {index_type}"
+        )
+        for i, item in enumerate(result):
+            assert item.ok(), (
+                f"Before drop_index,result={result},BInsertion result {i} is not OK for vector type {vector_type} and index type {index_type} and "
+            )
+
+        stats_after_insert1 = coll2.stats
+        assert stats_after_insert1 is not None, (
+            f"stats_after_insert1 is None for vector type {vector_type} and index type {index_type}"
+        )
+        assert stats_after_insert1.doc_count == 8, (
+            f"Expected 8 documents, got {stats_after_insert1.doc_count} for vector type {vector_type} and index type {index_type}"
+        )
+
+        fetched_docs = coll2.fetch([f"{i}" for i in range(5, 8)])
+        assert len(fetched_docs) == 3, (
+            f"Expected 3 fetched documents, got {len(fetched_docs)} for vector type {vector_type} and index type {index_type}"
+        )
+
+        for i in range(5, 8):
+            doc_id = f"{i}"
+            assert doc_id in fetched_docs, (
+                f"Document ID {doc_id} not found in fetched results for vector type {vector_type} and index type {index_type}"
+            )
+            assert fetched_docs[doc_id].id == doc_id, (
+                f"Document {doc_id} has incorrect ID field value for vector type {vector_type} and index type {index_type}"
+            )
+
+        coll2.drop_index(field_name=vector_field_name)
+
+        del coll2
+
+        # Reopen the collection
+        coll3 = zvec.open(path=str(collection_path), option=collection_option)
+
+        more_docs = [generate_doc(i, coll3.schema) for i in range(8, 10)]
+        result = coll3.insert(more_docs)
+        assert len(result) == 2, (
+            f"Expected 2 insertion results, got {len(result)} for vector type {vector_type} and index type {index_type}"
+        )
+        for i, item in enumerate(result):
+            assert item.ok(), (
+                f"After drop_index,Insertion result {i} is not OK for vector type {vector_type} and index type {index_type} and result={result}"
+            )
+
+        # Verify document count after second insertion
+        stats_after_insert2 = coll3.stats
+        assert stats_after_insert2 is not None, (
+            f"stats_after_insert2 is None for vector type {vector_type} and index type {index_type}"
+        )
+        assert stats_after_insert2.doc_count == 10, (
+            f"Expected 10 documents, got {stats_after_insert2.doc_count} for vector type {vector_type} and index type {index_type}"
+        )
+
+        # Fetch data
+        fetched_docs = coll3.fetch([f"{i}" for i in range(8, 10)])
+        assert len(fetched_docs) == 2, (
+            f"Expected 2 fetched documents, got {len(fetched_docs)} for vector type {vector_type} and index type {index_type}"
+        )
+
+        # Verify fetched documents have correct data
+        for i in range(8, 10):
+            doc_id = f"{i}"
+            assert doc_id in fetched_docs, (
+                f"Document ID {doc_id} not found in fetched results for vector type {vector_type} and index type {index_type}"
+            )
+            assert fetched_docs[doc_id].id == doc_id, (
+                f"Document {doc_id} has incorrect ID field value for vector type {vector_type} and index type {index_type}"
+            )
+
+        # Final verification
+        final_stats = coll3.stats
+        assert final_stats is not None, (
+            f"final_stats is None for vector type {vector_type} and index type {index_type}"
+        )
+        assert final_stats.doc_count == 10, (
+            f"Expected 10 documents, got {final_stats.doc_count} for vector type {vector_type} and index type {index_type}"
+        )
+        coll3.destroy()
+
     @staticmethod
     def create_collection(
         collection_path, collection_option: CollectionOption
@@ -1786,6 +2081,290 @@ class TestColumnDDL:
         stats = basic_collection.stats
         assert stats is not None
         assert stats.doc_count == 1
+
+    def test_add_column_with_reopen(self, tmp_path_factory):
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=columntest_collection_schema,
+            option=collection_option,
+        )
+
+        assert coll1 is not None, "Failed to create and open collection"
+
+        # Insert some data
+        doc1 = Doc(
+            id="1",
+            fields={"id": 1, "name": "test1"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {1: 1.0, 2: 2.0},
+            },
+        )
+
+        result = coll1.insert(doc1)
+        assert result.ok()
+
+        coll1.add_column(
+            field_schema=FieldSchema("income", DataType.INT32),
+            expression="200",  # Simple expression
+        )
+        doc2 = Doc(
+            id="2",
+            fields={"id": 2, "name": "test2", "income": 12},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {3: 1.1, 4: 2.1},
+            },
+        )
+
+        result = coll1.insert(doc2)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll1.stats
+        assert stats is not None
+        assert stats.doc_count == 2
+
+        collection_schema_new = coll1.schema
+
+        assert collection_schema_new.fields != columntest_collection_schema.fields
+
+        # Close the first collection (delete reference)
+        del coll1
+
+        # Reopen the collection
+        coll2 = zvec.open(path=str(collection_path), option=collection_option)
+
+        assert coll2 is not None, "Failed to reopen collection"
+        assert coll2.path == str(collection_path)
+        assert coll2.schema.name == collection_schema_new.name
+        assert coll2.schema.fields == collection_schema_new.fields
+
+        doc3 = Doc(
+            id="3",
+            fields={"id": 3, "name": "test3", "income": 13},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {5: 11.0, 6: 13.0},
+            },
+        )
+        result = coll2.insert(doc3)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll2.stats
+        assert stats is not None
+        assert stats.doc_count == 3
+
+        # Verify data is still there
+        fetched_docs = coll2.fetch(["1", "2", "3"])
+        for id in ["1", "2", "3"]:
+            assert id in fetched_docs
+            fetched_doc = fetched_docs[id]
+            assert fetched_doc.id == id
+            assert fetched_doc.field("name") == "test" + id
+
+        if hasattr(coll2, "destroy") and coll2 is not None:
+            try:
+                coll2.destroy()
+            except Exception as e:
+                print(f"Warning: failed to destroy collection: {e}")
+
+    def test_alter_column_with_reopen(self, tmp_path_factory):
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=columntest_collection_schema,
+            option=collection_option,
+        )
+        assert coll1 is not None, "Failed to create and open collection"
+
+        # Insert some data
+        doc1 = Doc(
+            id="1",
+            fields={"id": 1, "name": "test1"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {1: 1.0, 2: 2.0},
+            },
+        )
+
+        result = coll1.insert(doc1)
+        assert result.ok()
+
+        coll1.alter_column(
+            old_name="id",
+            new_name="id_new",
+            option=AlterColumnOption(),
+        )
+        doc2 = Doc(
+            id="2",
+            fields={"id_new": 2, "name": "test2"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {3: 1.1, 4: 2.1},
+            },
+        )
+
+        result = coll1.insert(doc2)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll1.stats
+        assert stats is not None
+        assert stats.doc_count == 2
+
+        collection_schema_new = coll1.schema
+
+        assert collection_schema_new.fields != columntest_collection_schema.fields
+
+        # Close the first collection (delete reference)
+        del coll1
+
+        # Reopen the collection
+        coll2 = zvec.open(path=str(collection_path), option=collection_option)
+
+        assert coll2 is not None, "Failed to reopen collection"
+        assert coll2.path == str(collection_path)
+        assert coll2.schema.name == collection_schema_new.name
+        assert coll2.schema.fields == collection_schema_new.fields
+
+        doc3 = Doc(
+            id="3",
+            fields={"id_new": 3, "name": "test3"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {5: 11.0, 6: 13.0},
+            },
+        )
+        result = coll2.insert(doc3)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll2.stats
+        assert stats is not None
+        assert stats.doc_count == 3
+
+        # Verify data is still there
+        fetched_docs = coll2.fetch(["1", "2", "3"])
+        for id in ["1", "2", "3"]:
+            assert id in fetched_docs
+            fetched_doc = fetched_docs[id]
+            assert fetched_doc.id == id
+            assert fetched_doc.field("name") == "test" + id
+
+        if hasattr(coll2, "destroy") and coll2 is not None:
+            try:
+                coll2.destroy()
+            except Exception as e:
+                print(f"Warning: failed to destroy collection: {e}")
+
+    def test_drop_column_with_reopen(self, tmp_path_factory):
+        # Create collection
+        temp_dir = tmp_path_factory.mktemp("zvec")
+        collection_path = temp_dir / "test_collection"
+
+        collection_option = CollectionOption(read_only=False, enable_mmap=True)
+        # Create and open collection
+        coll1 = zvec.create_and_open(
+            path=str(collection_path),
+            schema=columntest_collection_schema,
+            option=collection_option,
+        )
+
+        assert coll1 is not None, "Failed to create and open collection"
+
+        # Insert some data
+        doc1 = Doc(
+            id="1",
+            fields={"id": 1, "name": "test1"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {1: 1.0, 2: 2.0},
+            },
+        )
+
+        result = coll1.insert(doc1)
+        assert result.ok()
+
+        coll1.drop_column("id")
+        doc2 = Doc(
+            id="2",
+            fields={"name": "test2"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {3: 1.1, 4: 2.1},
+            },
+        )
+
+        result = coll1.insert(doc2)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll1.stats
+        assert stats is not None
+        assert stats.doc_count == 2
+
+        collection_schema_new = coll1.schema
+
+        assert collection_schema_new.fields != columntest_collection_schema.fields
+
+        # Close the first collection (delete reference)
+        del coll1
+
+        # Reopen the collection
+        coll2 = zvec.open(path=str(collection_path), option=collection_option)
+
+        assert coll2 is not None, "Failed to reopen collection"
+        assert coll2.path == str(collection_path)
+        assert coll2.schema.name == collection_schema_new.name
+        assert coll2.schema.fields == collection_schema_new.fields
+
+        doc3 = Doc(
+            id="3",
+            fields={"name": "test3"},
+            vectors={
+                "dense_fp32_field": np.random.random(128).tolist(),
+                "sparse_fp32_field": {5: 11.0, 6: 13.0},
+            },
+        )
+        result = coll2.insert(doc3)
+        assert bool(result), f"Expected 1 result, but got {len(result)}"
+        assert result.ok(), (
+            f"result={result},Insert operation failed with code = {result.code()}"
+        )
+        stats = coll2.stats
+        assert stats is not None
+        assert stats.doc_count == 3
+
+        # Verify data is still there
+        fetched_docs = coll2.fetch(["1", "2", "3"])
+        for id in ["1", "2", "3"]:
+            assert id in fetched_docs
+            fetched_doc = fetched_docs[id]
+            assert fetched_doc.id == id
+
+        if hasattr(coll2, "destroy") and coll2 is not None:
+            try:
+                coll2.destroy()
+            except Exception as e:
+                print(f"Warning: failed to destroy collection: {e}")
 
     def test_add_column_with_default_option(self, basic_collection: Collection):
         # Add a new column with default option
