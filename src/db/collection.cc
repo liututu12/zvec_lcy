@@ -1053,7 +1053,8 @@ Status CollectionImpl::validate(const std::string &column,
         return Status::InvalidArgument("Column name is empty");
       }
       if (schema_->has_field(schema->name())) {
-        return Status::InvalidArgument("column already exists");
+        return Status::InvalidArgument("column already exists: ",
+                                       schema->name());
       }
 
       auto s = schema->validate();
@@ -1064,7 +1065,8 @@ Status CollectionImpl::validate(const std::string &column,
 
       if (expression.empty() && !schema->nullable()) {
         return Status::InvalidArgument(
-            "Add column is not supported for non-nullable column");
+            "Add column is not supported for non-nullable column: ",
+            schema->name());
       }
 
       break;
@@ -1445,7 +1447,9 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
   WriteResults results;
   // validate write batch size
   if (docs.size() > kMaxWriteBatchSize) {
-    CHECK_RETURN_STATUS_EXPECTED(Status::InvalidArgument("Too many docs"));
+    CHECK_RETURN_STATUS_EXPECTED(Status::InvalidArgument(
+        "Too many docs: ", docs.size(), " exceeds max write batch size of ",
+        kMaxWriteBatchSize));
   }
 
   // validate docs
@@ -1562,7 +1566,7 @@ Status CollectionImpl::DeleteByFilter(const std::string &filter) {
   for (auto &doc : ret.value()) {
     Status s = writing_segment_->Delete(doc->doc_id());
     if (!s.ok()) {
-      LOG_ERROR("Delete doc_id failed");
+      LOG_ERROR("Delete doc_id: %zu failed", (size_t)doc->doc_id());
       return s;
     }
   }
@@ -1700,7 +1704,7 @@ Status CollectionImpl::recover_idmap_and_delete_store() {
   id_map_ = IDMap::CreateAndOpen(schema_->name(), idmap_path, false,
                                  options_.read_only_);
   if (!id_map_) {
-    return Status::InternalError("recovery idmap failed");
+    return Status::InternalError("recovery idmap failed, path: ", idmap_path);
   }
 
   // delete store
@@ -1709,7 +1713,8 @@ Status CollectionImpl::recover_idmap_and_delete_store() {
   delete_store_ =
       DeleteStore::CreateAndLoad(schema_->name(), delete_store_path);
   if (!delete_store_) {
-    return Status::InternalError("recovery delete store failed");
+    return Status::InternalError("recovery delete store failed, path: ",
+                                 delete_store_path);
   }
 
   return Status::OK();
@@ -1720,9 +1725,9 @@ Status CollectionImpl::create() {
   if (path_.empty()) {
     return Status::InvalidArgument("path validate failed: path is empty");
   }
-  if (!std::regex_match(path_, COLLECTION_PATH_REGEX)) {
+  if (!FileHelper::PathSimpleValidation(path_)) {
     return Status::InvalidArgument("path validate failed: path[", path_,
-                                   "] cannot pass the regex verification");
+                                   "] is not a valid path");
   }
   if (ailego::FileHelper::IsExist(path_.c_str())) {
     return Status::InvalidArgument("path validate failed: path[", path_,
@@ -1734,8 +1739,9 @@ Status CollectionImpl::create() {
   CHECK_RETURN_STATUS(s);
 
   if (!ailego::FileHelper::MakePath(path_.c_str())) {
-    return Status::InvalidArgument("create collection path failed: ", path_,
-                                   ", error: ", strerror(errno));
+    return Status::InvalidArgument(
+        "create collection path failed: ", path_,
+        ", error: ", ailego::FileHelper::GetLastErrorString());
   }
 
   // init lock file
@@ -1779,7 +1785,7 @@ Status CollectionImpl::create_idmap_and_delete_store() {
   id_map_ = IDMap::CreateAndOpen(schema_->name(), idmap_path, true,
                                  options_.read_only_);
   if (!id_map_) {
-    return Status::InternalError("create id map failed");
+    return Status::InternalError("create id map failed, path: ", idmap_path);
   }
 
   std::string delete_store_path =
@@ -1825,21 +1831,23 @@ Status CollectionImpl::acquire_file_lock(bool create) {
 
   if (create) {
     if (!lock_file_.create(lock_file_path.c_str(), 0)) {
-      return Status::InternalError("Can't create lock file");
+      return Status::InternalError("Can't create lock file: ", lock_file_path);
     }
   } else {
     if (!lock_file_.open(lock_file_path.c_str(), false)) {
-      return Status::InternalError("Can't open lock file");
+      return Status::InternalError("Can't open lock file: ", lock_file_path);
     }
   }
 
   if (options_.read_only_) {
     if (!ailego::FileLock::TryLockShared(lock_file_.native_handle())) {
-      return Status::InternalError("Can't lock read-only collection");
+      return Status::InternalError("Can't lock read-only collection: ",
+                                   lock_file_path);
     }
   } else {
     if (!ailego::FileLock::TryLock(lock_file_.native_handle())) {
-      return Status::InternalError("Can't lock read-write collection");
+      return Status::InternalError("Can't lock read-write collection: ",
+                                   lock_file_path);
     }
   }
 
